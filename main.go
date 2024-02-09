@@ -1,5 +1,3 @@
-// TODO FINISH THE ROOMS SYSTEM
-// last thing i did was implement creating a room
 package main
 
 import (
@@ -24,12 +22,22 @@ type Pool struct {
 }
 
 type Room struct {
-	Id         string    `json:"id"`
-	Name       string    `json:"name"`
-	Users      []*Client `json:"_"`
-	UsersCount int       `json:"users"`
+	Id    string
+	Name  string
+	Users []*Client
+}
+type RoomJson struct {
+	Id         string `json:"id"`
+	Name       string `json:"name"`
+	UsersCount int    `json:"users"`
 }
 
+func (r *Room) ToJson() RoomJson {
+	return RoomJson{Id: r.Id, Name: r.Name, UsersCount: len(r.Users)}
+}
+func (r *Room) Info() string {
+	return fmt.Sprintf("%s (%s) users:%d", r.Name, r.Id, len(r.Users))
+}
 func (r *Room) AddClient(c *Client) error {
 	for _, client := range r.Users {
 		if client == c {
@@ -37,7 +45,6 @@ func (r *Room) AddClient(c *Client) error {
 		}
 	}
 	r.Users = append(r.Users, c)
-	r.UsersCount = len(r.Users)
 	return nil
 }
 func (r *Room) RemoveClient(c *Client) error {
@@ -69,62 +76,53 @@ func NewPool() *Pool {
 }
 
 var rooms map[string]*Room
-var activeClients []*Client
+
+//var activeClients []*Client
 
 func (p *Pool) Start() {
 	for {
 		select {
 		case client := <-p.Register:
 			p.Clients[client] = true
-			activeClients = append(activeClients, client)
 			fmt.Println("size of connection pool", len(p.Clients))
-			if rooms[client.RoomId] == nil {
-				fmt.Println("the room you are tring to access doesn't exsist....")
-				return
+			room := rooms[client.RoomId]
+			if room == nil {
+				fmt.Println("room:", client.RoomId, " doesn't exsist....")
+				continue
 			}
-			err := rooms[client.RoomId].AddClient(client)
+			err := room.AddClient(client)
 			if err != nil {
 				fmt.Println(err)
+				continue
 			}
-			fmt.Println("user", client.Username, " joined room ", client.RoomId, "(", rooms[client.RoomId].Name, ")")
-			room := rooms[client.RoomId]
-			tempRome := Room{Name: room.Name, UsersCount: len(room.Users), Id: room.Id}
-			roomJson, _ := json.Marshal(tempRome)
-			msg := Message{Type: 1, Body: string(roomJson)}
-			fmt.Printf("sending a message to all %d users of room %s(%s)", tempRome.UsersCount, tempRome.Name, tempRome.Id)
-			for _, client := range rooms[client.RoomId].Users {
-				if err := client.Conn.WriteJSON(msg); err != nil {
+			fmt.Println("user", client.Username, " joined room ", room.Info())
+			anounce := Anouncement{Message: false, Data: "User Joined This Room", Sender: client.Username, Room: room.ToJson()}
+			for _, c := range room.Users {
+				if err := c.Conn.WriteJSON(anounce); err != nil {
 					fmt.Println(err)
-					return
 				}
 			}
 			break
 		case client := <-p.Unregister:
 			delete(p.Clients, client)
-			RemoveClientByUsername(client.Username)
 			fmt.Println("Size of Connection Pool: ", len(p.Clients))
 			fmt.Printf("user %s leaving room %s(%s) usersCount %d\n", client.Username, rooms[client.RoomId].Name, rooms[client.RoomId].Id, len(rooms[client.RoomId].Users))
 			err := rooms[client.RoomId].RemoveClient(client)
 			if err != nil {
 				fmt.Println(err)
-				return
+				continue
 			}
 			if room := rooms[client.RoomId]; room != nil {
-				tempRome := Room{Name: room.Name, UsersCount: len(room.Users), Id: room.Id}
-				roomJson, _ := json.Marshal(tempRome)
-				msg := Message{Type: 1, Body: string(roomJson)}
-				fmt.Printf("sending a message to all %d users of room %s(%s)", tempRome.UsersCount, tempRome.Name, tempRome.Id)
-				for _, client := range rooms[client.RoomId].Users {
-					if err := client.Conn.WriteJSON(msg); err != nil {
+				anounce := Anouncement{Message: false, Data: "User Left This Room", Sender: client.Username, Room: room.ToJson()}
+				for _, c := range room.Users {
+					if err := c.Conn.WriteJSON(anounce); err != nil {
 						fmt.Println(err)
-						return
 					}
 				}
 			}
 			break
 		case msg := <-p.Broadcast:
-			fmt.Println("Sending message to all clients in room", msg.RoomId)
-			msg.Type = 0
+			fmt.Println("Sending message to all clients in room", rooms[msg.RoomId].Info())
 			for _, client := range rooms[msg.RoomId].Users {
 				if err := client.Conn.WriteJSON(msg); err != nil {
 					fmt.Println(err)
@@ -142,10 +140,17 @@ type Client struct {
 	Pool     *Pool
 }
 
+type Anouncement struct {
+	Message bool     `json:"message"`
+	Room    RoomJson `json:"room"`
+	Data    string   `json:"data"`
+	Sender  string   `json:"sender"`
+}
 type Message struct {
-	Type   int    `json:"type"`
-	RoomId string `json:"room"`
-	Body   string `json:"body"`
+	Message bool   `json:"message"`
+	RoomId  string `json:"room"`
+	Data    string `json:"data"`
+	Sender  string `json:"sender"`
 }
 
 func (c *Client) Read() {
@@ -160,7 +165,7 @@ func (c *Client) Read() {
 			fmt.Println(err)
 			return
 		}
-		fmt.Println("message recived", msg.Body)
+		fmt.Printf("message: %s recived from : %s in room %s\n", msg.Data, msg.Sender, rooms[msg.RoomId].Info())
 		c.Pool.Broadcast <- msg
 	}
 }
@@ -199,28 +204,29 @@ func CreateSocket(w http.ResponseWriter, r *http.Request) *websocket.Conn {
 const charset = "abcdefghijklmnopqrstuvwxyz" +
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-func RemoveClientByUsername(username string) error {
-	var index int = -1
-	for i, c := range activeClients {
-		if c.Username == username {
-			index = i
-		}
-	}
-	if index == -1 {
-		return errors.New(fmt.Sprintf("client by username %s not found", username))
-	}
-	activeClients[index] = activeClients[len(activeClients)-1]
-	activeClients = activeClients[:len(activeClients)-1]
-	return nil
-}
-func GetClientByUsername(username string) (*Client, error) {
-	for _, c := range activeClients {
-		if c.Username == username {
-			return c, nil
-		}
-	}
-	return nil, errors.New(fmt.Sprintf("client by username %s not found", username))
-}
+//	func RemoveClientByUsername(username string) error {
+//		var index int = -1
+//		for i, c := range activeClients {
+//			if c.Username == username {
+//				index = i
+//			}
+//		}
+//		if index == -1 {
+//			return errors.New(fmt.Sprintf("client by username %s not found", username))
+//		}
+//		activeClients[index] = activeClients[len(activeClients)-1]
+//		activeClients = activeClients[:len(activeClients)-1]
+//		return nil
+//	}
+//
+//	func GetClientByUsername(username string) (*Client, error) {
+//		for _, c := range activeClients {
+//			if c.Username == username {
+//				return c, nil
+//			}
+//		}
+//		return nil, errors.New(fmt.Sprintf("client by username %s not found", username))
+//	}
 func generateID() string {
 	seededRand := rand.New(
 		rand.NewSource(time.Now().UnixNano()))
@@ -237,16 +243,12 @@ func setupRoutes() {
 	pool := NewPool()
 	go pool.Start()
 	mux.HandleFunc("/active_rooms", func(w http.ResponseWriter, r *http.Request) {
-		temprooms := make([]Room, 0)
+		temprooms := make([]RoomJson, 0)
 		for _, r := range rooms {
-			temprooms = append(temprooms, Room{
-				Name:       r.Name,
-				Id:         r.Id,
-				UsersCount: len(r.Users),
-			})
+			temprooms = append(temprooms, r.ToJson())
 		}
 		type ActiveRoomsJson struct {
-			Rooms []Room `json:"rooms"`
+			Rooms []RoomJson `json:"rooms"`
 		}
 		fmt.Printf("%d rooms were found\n", len(temprooms))
 		j, _ := json.Marshal(&ActiveRoomsJson{Rooms: temprooms})
@@ -330,14 +332,13 @@ func setupRoutes() {
 			fmt.Println(err)
 		}
 		room := &Room{
-			Id:         id,
-			Name:       temp.Name,
-			Users:      clients,
-			UsersCount: 0,
+			Id:    id,
+			Name:  temp.Name,
+			Users: clients,
 		}
 		rooms[id] = room
-		fmt.Printf("room %s ID:%s\ncreated succussfully\n", room.Name, room.Id)
-		roomJson, _ := json.Marshal(room)
+		fmt.Printf("room %s ID:%s created succussfully\n", room.Name, room.Id)
+		roomJson, _ := json.Marshal(room.ToJson())
 		fmt.Fprint(w, string(roomJson))
 	}).Methods("POST")
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -349,6 +350,6 @@ func setupRoutes() {
 func main() {
 	fmt.Println("Chat App v0.01")
 	rooms = make(map[string]*Room)
-	activeClients = make([]*Client, 0)
+	//activeClients = make([]*Client, 0)
 	setupRoutes()
 }
