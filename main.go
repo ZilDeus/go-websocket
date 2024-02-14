@@ -27,13 +27,17 @@ type Room struct {
 	Users []*Client
 }
 type RoomJson struct {
-	Id         string `json:"id"`
-	Name       string `json:"name"`
-	UsersCount int    `json:"users"`
+	Id    string   `json:"id"`
+	Name  string   `json:"name"`
+	Users []string `json:"users"`
 }
 
 func (r *Room) ToJson() RoomJson {
-	return RoomJson{Id: r.Id, Name: r.Name, UsersCount: len(r.Users)}
+	users := make([]string, len(r.Users))
+	for i, user := range r.Users {
+		users[i] = user.Username
+	}
+	return RoomJson{Id: r.Id, Name: r.Name, Users: users}
 }
 func (r *Room) Info() string {
 	return fmt.Sprintf("%s (%s) users:%d", r.Name, r.Id, len(r.Users))
@@ -65,6 +69,14 @@ func (r *Room) RemoveClient(c *Client) error {
 		}
 	}
 	return errors.New(fmt.Sprintf("user %s not in room %s (%s)", c.Username, r.Name, r.Id))
+}
+func (r *Room) GetClientByName(username string) (*Client, error) {
+	for _, c := range r.Users {
+		if c.Username == username {
+			return c, nil
+		}
+	}
+	return nil, errors.New(fmt.Sprintf("client with %s doesn't exsist", username))
 }
 func NewPool() *Pool {
 	return &Pool{
@@ -98,20 +110,9 @@ func (p *Pool) Start() {
 				continue
 			}
 			fmt.Println("user", client.Username, " joined room ", room.Info())
-			ann := Announcement{Sender: client.Username, Event: "user-joined", Data: room.ToJson()}
+			ann := Announcement{Sender: client.Username, Event: "room-update", Data: room.ToJson()}
 			for _, c := range room.Users {
 				if err := c.Conn.WriteJSON(ann); err != nil {
-					fmt.Println(err)
-				}
-			}
-			ann = Announcement{Event: "offer-found"}
-			for offerer, offer := range offers {
-				if offerer.RoomId != client.RoomId {
-					continue
-				}
-				ann.Data = offer
-				ann.Sender = offerer.Username
-				if err := client.Conn.WriteJSON(ann); err != nil {
 					fmt.Println(err)
 				}
 			}
@@ -133,7 +134,7 @@ func (p *Pool) Start() {
 				continue
 			}
 			if room := rooms[client.RoomId]; room != nil {
-				ann := Announcement{Sender: client.Username, Event: "user-left", Data: room.ToJson()}
+				ann := Announcement{Sender: client.Username, Event: "room-update", Data: room.ToJson()}
 				for _, c := range room.Users {
 					if err := c.Conn.WriteJSON(ann); err != nil {
 						fmt.Println(err)
@@ -210,6 +211,9 @@ func (c *Client) Read() {
 			fmt.Println(err)
 			return
 		}
+		if ann.Event == "" {
+			return
+		}
 		fmt.Printf("user %s sent an announcement %s\n", c.Username, ann.Event)
 		switch ann.Event {
 		case "message":
@@ -217,50 +221,39 @@ func (c *Client) Read() {
 			fmt.Printf("recived msg %s from client %s\n", msg.Body, msg.Sender)
 			c.Pool.Broadcast <- msg
 			break
-		case "offer-send":
-			offer := ParseOffer(&ann)
-			fmt.Printf("set client %s offer\n", c.Username)
-			offers[c] = offer
-			for _, roomC := range rooms[c.RoomId].Users {
-				if roomC.Username == c.Username {
-					continue
-				}
-				ann = Announcement{Event: "offer-recv", Sender: c.Username, Data: offer}
-				if err := roomC.Conn.WriteJSON(ann); err != nil {
-					fmt.Println(err)
-				}
-			}
-			break
-		case "canidate-send":
-			canidate := ParseCanidate(&ann)
-			if canidates[c.Username] == nil {
-				canidates[c.Username] = make([]string, 0)
-			}
-			canidates[c.Username] = append(canidates[c.Username], canidate)
-			fmt.Printf("set client %s canidate\n", c.Username)
-			fmt.Printf("client %s canidates size %d\n", c.Username, len(canidates[c.Username]))
-			break
-		case "answer-send":
-			other := ann.Sender
-			offer := ParseOffer(&ann)
-			fmt.Printf("client %s wants to answer clients %s call\n", c.Username, other)
-			otherCanidates := make([]string, 0)
-			for _, canidate := range canidates[other] {
-				otherCanidates = append(otherCanidates, canidate)
-			}
-			ann = Announcement{Event: "answer-recv", Sender: other, Data: otherCanidates}
-			if err := c.Conn.WriteJSON(ann); err != nil {
+		case "candidates":
+			json := ann.Data.(map[string]interface{})
+			from := json["from"].(string)
+			to := json["to"].(string)
+			fmt.Printf("recived candidates from %s to %s\n", from, to)
+			client, err := rooms[c.RoomId].GetClientByName(to)
+			if err != nil {
 				fmt.Println(err)
 			}
-			for _, roomC := range rooms[c.RoomId].Users {
-				if roomC.Username == other {
-					ann = Announcement{Event: "answer", Sender: c.Username, Data: offer}
-					if err := roomC.Conn.WriteJSON(ann); err != nil {
-						fmt.Println(err)
-					}
-					break
-				}
+			client.Conn.WriteJSON(Announcement{Event: "candidates", Sender: from, Data: ann.Data})
+			fmt.Printf("sent candidates to %s from %s\n", to, from)
+			break
+		case "offer":
+			json := ann.Data.(map[string]interface{})
+			from := json["from"].(string)
+			to := json["to"].(string)
+			fmt.Printf("recived offer from %s to %s\n", from, to)
+			client, err := rooms[c.RoomId].GetClientByName(to)
+			if err != nil {
+				fmt.Println(err)
 			}
+			client.Conn.WriteJSON(Announcement{Event: "offer", Sender: from, Data: ann.Data})
+			break
+		case "answer":
+			json := ann.Data.(map[string]interface{})
+			from := json["from"].(string)
+			to := json["to"].(string)
+			fmt.Printf("recived answer from %s to %s\n", from, to)
+			client, err := rooms[c.RoomId].GetClientByName(to)
+			if err != nil {
+				fmt.Println(err)
+			}
+			client.Conn.WriteJSON(Announcement{Event: "answer", Sender: to, Data: ann.Data})
 			break
 		}
 	}
@@ -332,6 +325,17 @@ func generateID() string {
 	}
 	return string(b)
 }
+func deleteEmptyRooms() {
+	roomsToDelete := make([]string, 0)
+	for _, r := range rooms {
+		if len(r.Users) <= 0 {
+			roomsToDelete = append(roomsToDelete, r.Id)
+		}
+	}
+	for _, r := range roomsToDelete {
+		delete(rooms, r)
+	}
+}
 func setupRoutes() {
 	router := mux.NewRouter()
 	cors := cors.AllowAll()
@@ -354,6 +358,7 @@ func setupRoutes() {
 		fmt.Fprintf(w, string(json))
 	}).Methods("GET")
 	router.HandleFunc("/active_rooms", func(w http.ResponseWriter, r *http.Request) {
+		deleteEmptyRooms()
 		temprooms := make([]RoomJson, 0)
 		for _, r := range rooms {
 			temprooms = append(temprooms, r.ToJson())
@@ -392,6 +397,7 @@ func setupRoutes() {
 		serveWs(pool, w, r)
 	})
 	http.ListenAndServe(":8080", server)
+	fmt.Println(router)
 }
 
 func main() {

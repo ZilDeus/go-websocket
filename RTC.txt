@@ -1,0 +1,37 @@
+RAW:
+2 peers
+- c1 sends his offer to the server
+- c1 sends his ice canidates to the server
+- c2 sends his answer to the server
+- c2 recives c1s offer and ice from the server
+- DONE
+3 peers
+- same as 2 peers
+- c3 sends his 2 offers and 2 ice  to the server
+- c2 recives one of them
+- c1 recives the other
+4 peers
+- same as 2 peers
+- c3 sends 3 offers and 3 ice to the server
+- c4 sends 3 offer and 3 ice to the server
+- c1 recives 2
+- c2 recives 2
+5 peers
+- same as 4
+- c5 sends 4 offer and ice
+- c4,3,2,1 all recive one
+
+RTCOffer data structure:
+- from *Client , to *Client
+- offer {type,sdp}
+- answer {type,sdp}
+- ice canidate []string
+with RTCOffer:
+2 peers
+- c1 sends RTCOffer{from:self,to:c2}
+- c2 recives
+3 peers
+- same as 2 peers
+- c3 sends RTCOffer{from:self,to:{c1,c2}}
+- c1 recives
+- c2 recives
