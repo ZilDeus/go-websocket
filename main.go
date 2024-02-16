@@ -492,7 +492,7 @@ func setupRoutes() {
 	router.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWs(pool, w, r)
 	})
-	err := http.ListenAndServeTLS(":8080", "test.crt", "test.key", server)
+	err := http.ListenAndServe(":8080", server)
 	if err != nil {
 		fmt.Println(err)
 	}
