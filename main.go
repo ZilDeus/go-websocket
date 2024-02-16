@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -14,11 +16,18 @@ import (
 	"github.com/rs/cors"
 )
 
+var rooms map[string]*Room
+var offers map[*Client]Offer
+var canidates map[string][]string
+var pool *Pool
+
 type Pool struct {
 	Register   chan *Client
 	Unregister chan *Client
 	Clients    map[*Client]bool
 	Broadcast  chan Message
+	Created    chan *Room
+	Deleted    chan string
 }
 
 type Room struct {
@@ -32,6 +41,55 @@ type RoomJson struct {
 	Users []string `json:"users"`
 }
 
+func GenerateSSEResponses(w http.ResponseWriter, r *http.Request) {
+	for {
+		select {
+		case id := <-pool.Deleted:
+			fmt.Printf("sending delete event, id %s\n", id)
+			response, err := formatServerSentEvent("delete", id)
+			if err != nil {
+				fmt.Println(err)
+			}
+			fmt.Fprintf(w, response)
+			w.(http.Flusher).Flush()
+			break
+		case room := <-pool.Created:
+			fmt.Printf("sending create event, room %s\n", room.Info())
+			response, err := formatServerSentEvent("create", room.ToJson())
+			if err != nil {
+				fmt.Println(err)
+			}
+			fmt.Fprintf(w, response)
+			w.(http.Flusher).Flush()
+			break
+		case <-r.Context().Done():
+			fmt.Println("client disconnected")
+			return
+		}
+	}
+}
+func formatServerSentEvent(event string, data any) (string, error) {
+	m := map[string]any{
+		"data": data,
+	}
+
+	buff := bytes.NewBuffer([]byte{})
+
+	encoder := json.NewEncoder(buff)
+
+	err := encoder.Encode(m)
+	if err != nil {
+		return "", err
+	}
+
+	sb := strings.Builder{}
+
+	sb.WriteString(fmt.Sprintf("event: %s\n", event))
+	sb.WriteString(fmt.Sprintf("data: %v\n\n", buff.String()))
+
+	return sb.String(), nil
+}
+
 func (r *Room) ToJson() RoomJson {
 	users := make([]string, len(r.Users))
 	for i, user := range r.Users {
@@ -39,18 +97,21 @@ func (r *Room) ToJson() RoomJson {
 	}
 	return RoomJson{Id: r.Id, Name: r.Name, Users: users}
 }
+
 func (r *Room) Info() string {
-	return fmt.Sprintf("%s (%s) users:%d", r.Name, r.Id, len(r.Users))
+	return fmt.Sprintf("%s (%s) clients:%d", r.Name, r.Id, len(r.Users))
 }
+
 func (r *Room) AddClient(c *Client) error {
 	for _, client := range r.Users {
 		if client == c {
-			return errors.New(fmt.Sprintf("user %s already in room %s (%s)", c.Username, r.Name, r.Id))
+			return errors.New(fmt.Sprintf("client %s already in room %s (%s)", c.Username, r.Name, r.Id))
 		}
 	}
 	r.Users = append(r.Users, c)
 	return nil
 }
+
 func (r *Room) RemoveClient(c *Client) error {
 	if r == nil {
 		return errors.New(fmt.Sprint("room already nil"))
@@ -60,6 +121,7 @@ func (r *Room) RemoveClient(c *Client) error {
 			if len(r.Users) == 1 {
 				fmt.Printf("DELETING room %s(%s) as it's now empty\n", r.Name, r.Id)
 				delete(rooms, r.Id)
+				pool.Deleted <- r.Id
 				fmt.Println("deleted")
 			} else {
 				r.Users[i] = r.Users[len(r.Users)-1]
@@ -68,8 +130,9 @@ func (r *Room) RemoveClient(c *Client) error {
 			return nil
 		}
 	}
-	return errors.New(fmt.Sprintf("user %s not in room %s (%s)", c.Username, r.Name, r.Id))
+	return errors.New(fmt.Sprintf("client %s not in room %s (%s)", c.Username, r.Name, r.Id))
 }
+
 func (r *Room) GetClientByName(username string) (*Client, error) {
 	for _, c := range r.Users {
 		if c.Username == username {
@@ -78,20 +141,17 @@ func (r *Room) GetClientByName(username string) (*Client, error) {
 	}
 	return nil, errors.New(fmt.Sprintf("client with %s doesn't exsist", username))
 }
+
 func NewPool() *Pool {
 	return &Pool{
 		Register:   make(chan *Client),
 		Unregister: make(chan *Client),
 		Clients:    make(map[*Client]bool),
 		Broadcast:  make(chan Message),
+		Created:    make(chan *Room),
+		Deleted:    make(chan string),
 	}
 }
-
-var rooms map[string]*Room
-var offers map[*Client]Offer
-var canidates map[string][]string
-
-//var activeClients []*Client
 
 func (p *Pool) Start() {
 	for {
@@ -109,7 +169,7 @@ func (p *Pool) Start() {
 				fmt.Println(err)
 				continue
 			}
-			fmt.Println("user", client.Username, " joined room ", room.Info())
+			fmt.Println("client", client.Username, " joined room ", room.Info())
 			ann := Announcement{Sender: client.Username, Event: "room-update", Data: room.ToJson()}
 			for _, c := range room.Users {
 				if err := c.Conn.WriteJSON(ann); err != nil {
@@ -127,7 +187,7 @@ func (p *Pool) Start() {
 				continue
 			}
 			fmt.Println("Size of Connection Pool: ", len(p.Clients))
-			fmt.Println("user", client.Username, " left room ", room.Info())
+			fmt.Println("client", client.Username, " left room ", room.Info())
 			err := rooms[client.RoomId].RemoveClient(client)
 			if err != nil {
 				fmt.Println(err)
@@ -214,7 +274,7 @@ func (c *Client) Read() {
 		if ann.Event == "" {
 			return
 		}
-		fmt.Printf("user %s sent an announcement %s\n", c.Username, ann.Event)
+		fmt.Printf("client %s sent an announcement %s\n", c.Username, ann.Event)
 		switch ann.Event {
 		case "message":
 			msg := ParseMessage(&ann)
@@ -243,6 +303,51 @@ func (c *Client) Read() {
 				fmt.Println(err)
 			}
 			client.Conn.WriteJSON(Announcement{Event: "offer", Sender: from, Data: ann.Data})
+			break
+		case "load":
+			from := ann.Sender
+			room := rooms[c.RoomId]
+			fmt.Printf("recived load event from %s\n", from)
+			if len(room.Users) == 1 {
+				fmt.Printf("not enogh client in room %s", room.Info())
+				continue
+			}
+			for _, client := range room.Users {
+				if c.Username == client.Username {
+					continue
+				}
+				client.Conn.WriteJSON(Announcement{Event: "load", Sender: from, Data: ann.Data})
+			}
+			break
+		case "play":
+			from := ann.Sender
+			room := rooms[c.RoomId]
+			fmt.Printf("recived play event from %s\n", from)
+			if len(room.Users) == 1 {
+				fmt.Printf("not enogh client in room %s", room.Info())
+				continue
+			}
+			for _, client := range room.Users {
+				if c.Username == client.Username {
+					continue
+				}
+				client.Conn.WriteJSON(Announcement{Event: "play", Sender: from, Data: ann.Data})
+			}
+			break
+		case "pause":
+			from := ann.Sender
+			room := rooms[c.RoomId]
+			fmt.Printf("recived pause event from %s\n", from)
+			if len(room.Users) == 1 {
+				fmt.Printf("not enogh client in room %s", room.Info())
+				continue
+			}
+			for _, client := range room.Users {
+				if c.Username == client.Username {
+					continue
+				}
+				client.Conn.WriteJSON(Announcement{Event: "pause", Sender: from, Data: ann.Data})
+			}
 			break
 		case "answer":
 			json := ann.Data.(map[string]interface{})
@@ -293,29 +398,6 @@ func CreateSocket(w http.ResponseWriter, r *http.Request) *websocket.Conn {
 const charset = "abcdefghijklmnopqrstuvwxyz" +
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-//	func RemoveClientByUsername(username string) error {
-//		var index int = -1
-//		for i, c := range activeClients {
-//			if c.Username == username {
-//				index = i
-//			}
-//		}
-//		if index == -1 {
-//			return errors.New(fmt.Sprintf("client by username %s not found", username))
-//		}
-//		activeClients[index] = activeClients[len(activeClients)-1]
-//		activeClients = activeClients[:len(activeClients)-1]
-//		return nil
-//	}
-//
-//	func GetClientByUsername(username string) (*Client, error) {
-//		for _, c := range activeClients {
-//			if c.Username == username {
-//				return c, nil
-//			}
-//		}
-//		return nil, errors.New(fmt.Sprintf("client by username %s not found", username))
-//	}
 func generateID() string {
 	seededRand := rand.New(
 		rand.NewSource(time.Now().UnixNano()))
@@ -340,8 +422,16 @@ func setupRoutes() {
 	router := mux.NewRouter()
 	cors := cors.AllowAll()
 	server := cors.Handler(router)
-	pool := NewPool()
 	go pool.Start()
+	router.HandleFunc("/rooms_sse", func(w http.ResponseWriter, r *http.Request) {
+		_, isSupported := w.(http.Flusher)
+		if !isSupported {
+			fmt.Println("server sent events are not supported on your browser :(")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		GenerateSSEResponses(w, r)
+	})
 	router.HandleFunc("/room/{id}", func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
 		id := vars["id"]
@@ -362,6 +452,11 @@ func setupRoutes() {
 		temprooms := make([]RoomJson, 0)
 		for _, r := range rooms {
 			temprooms = append(temprooms, r.ToJson())
+		}
+		if len(temprooms) == 0 {
+			for c := range pool.Clients {
+				delete(pool.Clients, c)
+			}
 		}
 		type ActiveRoomsJson struct {
 			Rooms []RoomJson `json:"rooms"`
@@ -391,19 +486,23 @@ func setupRoutes() {
 		rooms[id] = room
 		fmt.Printf("room %s ID:%s created succussfully\n", room.Name, room.Id)
 		roomJson, _ := json.Marshal(room.ToJson())
+		pool.Created <- room
 		fmt.Fprint(w, string(roomJson))
 	}).Methods("POST")
 	router.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWs(pool, w, r)
 	})
-	http.ListenAndServe(":8080", server)
-	fmt.Println(router)
+	err := http.ListenAndServeTLS(":8080", "test.crt", "test.key", server)
+	if err != nil {
+		fmt.Println(err)
+	}
 }
 
 func main() {
-	fmt.Println("Chat App v0.01")
+	fmt.Println("Chat App v0.02")
 	rooms = make(map[string]*Room)
 	offers = make(map[*Client]Offer)
 	canidates = make(map[string][]string)
+	pool = NewPool()
 	setupRoutes()
 }
